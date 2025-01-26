@@ -52,12 +52,18 @@ model_yolo, model_moondream = load_models()
 def process_frame(frame):
     global last_frame, detection_history
     
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    last_frame = Image.fromarray(frame_rgb)
+    # Store the RGB version for the model
+    last_frame = Image.fromarray(frame)
+    
+    # Convert to BGR for YOLOv10 processing
+    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
     
     # Object detection using YOLOv10
-    img_with_boxes = model_yolo.detect_objects(frame_rgb, conf_threshold=0.3)
-    return img_with_boxes
+    img_with_boxes = model_yolo.detect_objects(frame_bgr, conf_threshold=0.3)
+    
+    # Convert back to RGB for display
+    img_with_boxes_rgb = cv2.cvtColor(img_with_boxes, cv2.COLOR_BGR2RGB)
+    return img_with_boxes_rgb
 
 def text_to_speech_output(text):
     if text:
