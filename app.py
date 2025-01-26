@@ -13,11 +13,11 @@ import time
 from gtts import gTTS
 import sounddevice as sd
 from scipy.io.wavfile import write
-import torchvision
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from torchvision.models.detection import FasterRCNN_ResNet50_FPN_Weights
 import collections
 from IPython.display import Audio
+from huggingface_hub import hf_hub_download
+from inference import YOLOv10
 
 load_dotenv()
 client = Groq()
@@ -33,11 +33,12 @@ device_yolo = torch.device("cpu")
 device_moondream = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def load_models():
-    model_yolo = torchvision.models.detection.fasterrcnn_resnet50_fpn(
-        weights=FasterRCNN_ResNet50_FPN_Weights.DEFAULT
-    ).to(device_yolo)
-    model_yolo.eval()
-
+    model_file = hf_hub_download(
+        repo_id="onnx-community/yolov10n", 
+        filename="onnx/model.onnx"
+    )
+    model_yolo = YOLOv10(model_file)
+    
     model_moondream = AutoModelForCausalLM.from_pretrained(
         "vikhyatk/moondream2",
         revision="2025-01-09",
@@ -54,34 +55,8 @@ def process_frame(frame):
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     last_frame = Image.fromarray(frame_rgb)
     
-    # Object detection
-    with torch.no_grad():
-        img_tensor = torch.from_numpy(frame_rgb).permute(2, 0, 1).float().unsqueeze(0) / 255.0
-        img_tensor = img_tensor.to(device_yolo)
-        predictions = model_yolo(img_tensor)[0]
-
-    boxes = predictions['boxes'].cpu()
-    scores = predictions['scores'].cpu()
-    labels = predictions['labels'].cpu()
-    
-    keep = torchvision.ops.nms(boxes, scores, iou_threshold=0.5)
-    
-    detected_objects = []
-    img_with_boxes = np.copy(frame_rgb)
-    
-    for i in keep:
-        if scores[i] > 0.7:
-            box = boxes[i].int().tolist()
-            label = labels[i].item()
-            score = scores[i].item()
-            class_name = FasterRCNN_ResNet50_FPN_Weights.DEFAULT.meta["categories"][label]
-            detected_objects.append(class_name)
-            
-            cv2.rectangle(img_with_boxes, (box[0], box[1]), (box[2], box[3]), (0, 255, 0), 2)
-            cv2.putText(img_with_boxes, f"{class_name}: {score:.2f}", 
-                       (box[0], box[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-    
-    detection_history.append(detected_objects)
+    # Object detection using YOLOv10
+    img_with_boxes = model_yolo.detect_objects(frame_rgb, conf_threshold=0.3)
     return img_with_boxes
 
 def text_to_speech_output(text):
@@ -171,29 +146,46 @@ with gr.Blocks() as app:
     
     with gr.Row():
         with gr.Column():
-            camera_input = gr.Image(sources=["webcam"], streaming=True)  # Changed 'source' to 'sources'
-            video_output = gr.Image(label="Processed Feed")
+            camera_input = gr.Image(sources=["webcam"], streaming=True)
+            video_output = gr.Image(label="Processed Feed", streaming=True)
         
         with gr.Column():
-            audio_input = gr.Audio(sources=["microphone"], type="numpy", streaming=False)  # Also updated Audio component
+            audio_input = gr.Audio(sources=["microphone"], type="numpy")
             transcription = gr.Textbox(label="Transcription")
             caption = gr.Textbox(label="Image Caption")
             caption_audio = gr.Audio(label="Caption Audio", format="mp3")
     
     with gr.Row():
-        chatbot = gr.Chatbot(type="messages")  # Changed to use messages format
+        chatbot = gr.Chatbot(type="messages")
         msg = gr.Textbox(label="Chat with the model")
-        response_audio = gr.Audio(label="Response Audio", format="mp3", autoplay=True)  # Added autoplay
+        response_audio = gr.Audio(label="Response Audio", format="mp3")
 
     # Set up event handlers
-    camera_input.stream(process_frame, inputs=[camera_input], outputs=[video_output])
-    audio_input.stop_recording(record_audio, inputs=[audio_input], 
-                             outputs=[transcription, caption, caption_audio])
-    msg.submit(chat_with_image, inputs=[msg, chatbot], 
-              outputs=[msg, chatbot, response_audio])
+    camera_input.stream(
+        fn=process_frame,
+        inputs=[camera_input],
+        outputs=[video_output],
+        queue=True,
+        stream_every=0.1  # 10 FPS
+    )
+    
+    audio_input.stop_recording(
+        fn=record_audio,
+        inputs=[audio_input],
+        outputs=[transcription, caption, caption_audio],
+        queue=True
+    )
+    
+    msg.submit(
+        fn=chat_with_image,
+        inputs=[msg, chatbot],
+        outputs=[msg, chatbot, response_audio],
+        queue=True
+    )
 
-# Launch the app with corrected parameters
-app.launch(
+app.queue().launch(
+    server_name="127.0.0.1",
+    server_port=7860,
     share=True,
-    server_name="0.0.0.0",
-    server_port=7860)
+    max_threads=3
+)
