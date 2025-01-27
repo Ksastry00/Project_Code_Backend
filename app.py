@@ -13,11 +13,13 @@ import time
 from gtts import gTTS
 import sounddevice as sd
 from scipy.io.wavfile import write
-from transformers import AutoModelForCausalLM, AutoTokenizer
 import collections
 from IPython.display import Audio
 from huggingface_hub import hf_hub_download
-from inference import YOLOv10
+from transformers import AutoProcessor, AutoModelForVision2Seq, YolosImageProcessor, YolosForObjectDetection
+from transformers.image_utils import load_image
+import torch
+import requests
 
 load_dotenv()
 client = Groq()
@@ -30,24 +32,16 @@ detection_history = collections.deque(maxlen=5)
 
 # Device configuration
 device_yolo = torch.device("cpu")
-device_moondream = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Using device: {DEVICE}")
+image_processor = YolosImageProcessor.from_pretrained("hustvl/yolos-tiny")
+model_yolos = YolosForObjectDetection.from_pretrained('hustvl/yolos-tiny').to(DEVICE)
 
-def load_models():
-    model_file = hf_hub_download(
-        repo_id="onnx-community/yolov10n", 
-        filename="onnx/model.onnx"
-    )
-    model_yolo = YOLOv10(model_file)
-    
-    model_moondream = AutoModelForCausalLM.from_pretrained(
-        "vikhyatk/moondream2",
-        revision="2025-01-09",
-        trust_remote_code=True,
-        device_map={"": device_moondream}
-    )
-    return model_yolo, model_moondream
-
-model_yolo, model_moondream = load_models()
+processor = AutoProcessor.from_pretrained("HuggingFaceTB/SmolVLM-256M-Instruct")
+model_smolvlm = AutoModelForVision2Seq.from_pretrained(
+    "HuggingFaceTB/SmolVLM-256M-Instruct",
+    torch_dtype=torch.bfloat16,
+).to(DEVICE)
 
 def process_frame(frame):
     global last_frame, detection_history
@@ -55,32 +49,45 @@ def process_frame(frame):
     # Store the RGB version for the model
     last_frame = Image.fromarray(frame)
     
-    # Convert to BGR for YOLOv10 processing
-    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-    
-    # Object detection using YOLOv10
-    img_with_boxes = model_yolo.detect_objects(frame_bgr, conf_threshold=0.3)
-    
-    # Convert back to RGB for display
-    img_with_boxes_rgb = cv2.cvtColor(img_with_boxes, cv2.COLOR_BGR2RGB)
-    return img_with_boxes_rgb
+    # Object detection using YOLOS
+    pil_image = Image.fromarray(frame)
+    inputs = image_processor(images=pil_image, return_tensors="pt").to(DEVICE)
+    outputs = model_yolos(**inputs)
 
+    # model predicts bounding boxes and corresponding COCO classes
+    target_sizes = torch.tensor([pil_image.size[::-1]]).to(DEVICE)
+    results = image_processor.post_process_object_detection(outputs, threshold=0.9, target_sizes=target_sizes)[0]
+    
+    img_with_boxes = np.array(pil_image)
+    for score, label, box in zip(results["scores"], results["labels"], results["boxes"]):
+        box = [round(i, 2) for i in box.tolist()]
+        
+        cv2.rectangle(img_with_boxes, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), (0, 255, 0), 2)
+        cv2.putText(img_with_boxes, f"{model_yolos.config.id2label[label.item()]} {round(score.item(), 3)}", (int(box[0]), int(box[1]) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+    
+    return img_with_boxes
+
+tts_temp_file = None
 def text_to_speech_output(text):
+    global tts_temp_file
     if text:
         try:
             tts = gTTS(text=text, lang='en')
-            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-            temp_file.close()
-            tts.save(temp_file.name)
+            if tts_temp_file is None:
+                tts_temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+                tts_temp_file.close()
+            tts.save(tts_temp_file.name)
             
             # Return just the file path for Gradio audio component
-            return temp_file.name
+            return tts_temp_file.name
         except Exception as e:
             print(f"TTS Error: {str(e)}")
             return None
     return None
 
+transcription_cache = {}
 def record_audio(audio):
+    global transcription_cache
     temp_file = None
     if audio is not None and isinstance(audio, tuple) and len(audio) == 2:
         try:
@@ -98,17 +105,39 @@ def record_audio(audio):
                 write(temp_file.name, sample_rate, audio_data)
                 
                 # Transcribe with Groq
-                with open(temp_file.name, 'rb') as file:
-                    transcription = client.audio.transcriptions.create(
-                        file=(os.path.basename(temp_file.name), file),
-                        model="whisper-large-v3-turbo",
-                        response_format="json",
-                        language="en",
-                    )
+                if temp_file.name in transcription_cache:
+                    transcription = transcription_cache[temp_file.name]
+                else:
+                    with open(temp_file.name, 'rb') as file:
+                        transcription = client.audio.transcriptions.create(
+                            file=(os.path.basename(temp_file.name), file),
+                            model="whisper-large-v3-turbo",
+                            response_format="json",
+                            language="en",
+                        )
+                    transcription_cache[temp_file.name] = transcription
                 
                 # Generate caption and TTS
                 if last_frame:
-                    caption = model_moondream.caption(last_frame, length="normal")["caption"]
+                    messages = [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "image"},
+                                {"type": "text", "text": transcription.text},
+                            ]
+                        },
+                    ]
+                    prompt = processor.apply_chat_template(messages, add_generation_prompt=True)
+                    inputs = processor(text=prompt, images=[last_frame], return_tensors="pt")
+                    inputs = inputs.to(DEVICE)
+
+                    generated_ids = model_smolvlm.generate(**inputs, max_new_tokens=500)
+                    generated_texts = processor.batch_decode(
+                        generated_ids,
+                        skip_special_tokens=True,
+                    )
+                    caption = generated_texts[0]
                     audio_path = text_to_speech_output(caption)
                     return transcription.text, caption, audio_path
             
@@ -130,7 +159,25 @@ def record_audio(audio):
 def chat_with_image(message, history):
     if last_frame and message:
         try:
-            response = model_moondream.query(last_frame, message)["answer"]
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": message}
+                    ]
+                },
+            ]
+            prompt = processor.apply_chat_template(messages, add_generation_prompt=True)
+            inputs = processor(text=prompt, images=[last_frame], return_tensors="pt")
+            inputs = inputs.to(DEVICE)
+
+            generated_ids = model_smolvlm.generate(**inputs, max_new_tokens=500)
+            generated_texts = processor.batch_decode(
+                generated_ids,
+                skip_special_tokens=True,
+            )
+            response = generated_texts[0]
             history = history + [
                 {"role": "user", "content": message},
                 {"role": "assistant", "content": response}
@@ -147,7 +194,7 @@ def chat_with_image(message, history):
     return "", history, None
 
 # Gradio UI
-with gr.Blocks() as app:
+with gr.Blocks(delete_cache=(60, 60)) as app:
     gr.Markdown("# Real-Time Multimodal Video Analysis")
     
     with gr.Row():
