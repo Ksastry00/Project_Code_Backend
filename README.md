@@ -86,3 +86,6 @@ python app.py
 - Audio responses autoplay by default
 - Chat history is maintained during the session
 - For optimal performance, ensure good lighting for the webcam
+## Todo
+- Test Qwen2.5VL, InternVL
+- Test other object  detection models (DETR, Detectron, Faster RCNN, etc)
