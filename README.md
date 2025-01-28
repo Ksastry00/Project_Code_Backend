@@ -87,5 +87,5 @@ python app.py
 - Chat history is maintained during the session
 - For optimal performance, ensure good lighting for the webcam
 ## Todo
-- Test Qwen2.5VL, InternVL
+- Test Qwen2.5VL, InternVL, NVIDIA EAGLE
 - Test other object  detection models (DETR, Detectron, Faster RCNN, etc)
