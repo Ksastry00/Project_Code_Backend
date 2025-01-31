@@ -2,3 +2,5 @@
 .env
 *.txt
 *.dll
+.goose
+.env

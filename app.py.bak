@@ -88,12 +88,10 @@ def text_to_speech_output(text):
 
 def record_audio(audio):
     temp_file = None
-    print(f"Received audio: {type(audio)}, value: {audio}")
     if audio is not None and isinstance(audio, tuple) and len(audio) == 2:
         try:
             sample_rate, audio_data = audio
             
-            print(f"Sample rate: {sample_rate}, Audio data shape: {audio_data.shape if isinstance(audio_data, np.ndarray) else 'not numpy array'}")
             if isinstance(audio_data, np.ndarray):
                 # Ensure audio data is in correct format
                 if len(audio_data.shape) == 2:
@@ -105,29 +103,20 @@ def record_audio(audio):
                 temp_file.close()
                 write(temp_file.name, sample_rate, audio_data)
                 
-                print(f"Saved audio to temporary file: {temp_file.name}")
                 # Transcribe with Groq
-                print("Attempting Groq transcription...")
-                try:
-                    with open(temp_file.name, 'rb') as file:
-                        file_basename = os.path.basename(temp_file.name)
-                        print(f"Sending file {file_basename} to Groq...")
-                        transcription = client.audio.transcriptions.create(
-                            file=(file_basename, file),
-                            model="whisper-large-v3",
-                            response_format="text",
-                            language="en"
-                        )
-                        print(f"Received transcription: {transcription}")
-                        # Generate caption and TTS
-                        if last_frame:
-                            caption = model_moondream.caption(last_frame, length="normal")["caption"]
-                            audio_path = text_to_speech_output(caption)
-                            return transcription, caption, audio_path
-                        return transcription, "No frame available for caption", None
-                except Exception as e:
-                    print(f"Groq transcription error: {str(e)}")
-                    return f"Transcription error: {str(e)}", "Error during transcription", None
+                with open(temp_file.name, 'rb') as file:
+                    transcription = client.audio.transcriptions.create(
+                        file=(os.path.basename(temp_file.name), file),
+                        model="whisper-large-v3-turbo",
+                        response_format="json",
+                        language="en",
+                    )
+                
+                # Generate caption and TTS
+                if last_frame:
+                    caption = model_moondream.caption(last_frame, length="normal")["caption"]
+                    audio_path = text_to_speech_output(caption)
+                    return transcription.text, caption, audio_path
             
             return "", "No audio data received", None
             
@@ -173,7 +162,7 @@ with gr.Blocks() as app:
             video_output = gr.Image(label="Processed Feed", streaming=True)
         
         with gr.Column():
-            audio_input = gr.Audio(sources=["microphone"], type="numpy", streaming=False)
+            audio_input = gr.Audio(sources=["microphone"], type="numpy")
             transcription = gr.Textbox(label="Transcription")
             caption = gr.Textbox(label="Image Caption")
             caption_audio = gr.Audio(label="Caption Audio", format="mp3")
@@ -195,13 +184,6 @@ with gr.Blocks() as app:
         outputs=[video_output],
         queue=True,
         stream_every=0.1  # 10 FPS
-    )
-    
-    audio_input.change(
-        fn=record_audio,
-        inputs=[audio_input],
-        outputs=[transcription, caption, caption_audio],
-        queue=True
     )
     
     msg.submit(
