@@ -144,51 +144,52 @@ def text_to_speech_output(text):
             return None
     return None
 
-def transcribe_audio_async(temp_file_name, callback):
+async def transcribe_audio_async(temp_file_name):
     """
     Asynchronously transcribe audio using Groq's Whisper API and generate image captions.
     
     Args:
         temp_file_name (str): Path to temporary audio file
-        callback (callable): Function to handle transcription results
+    
+    Returns:
+        tuple: (transcription, caption_text, caption_audio_path)
     """
-    def transcription_thread():
-        transcription, caption_text, caption_audio_path = "", "", None
-        try:
-            with open(temp_file_name, 'rb') as file:
-                file_basename = os.path.basename(temp_file_name)
-                transcription = client.audio.transcriptions.create(
-                    file=(file_basename, file),
-                    model="whisper-large-v3",
-                    response_format="text",
-                    language="en"
-                )
-                print(f"Received transcription: {transcription}")
-                if last_frame:
-                    # Use autocast if on CUDA for the caption generation if supported
-                    with torch.no_grad():
-                        if torch.cuda.is_available():
-                            with torch.cuda.amp.autocast():
-                                caption_text = model_moondream.caption(last_frame, length="normal")["caption"]
-                        else:
+    transcription, caption_text, caption_audio_path = "", "", None
+    try:
+        with open(temp_file_name, 'rb') as file:
+            file_basename = os.path.basename(temp_file_name)
+            transcription = client.audio.transcriptions.create(
+                file=(file_basename, file),
+                model="whisper-large-v3",
+                response_format="text",
+                language="en"
+            )
+            print(f"Received transcription: {transcription}")
+            if last_frame:
+                # Use autocast if on CUDA for the caption generation if supported
+                with torch.no_grad():
+                    if torch.cuda.is_available():
+                        with torch.cuda.amp.autocast():
                             caption_text = model_moondream.caption(last_frame, length="normal")["caption"]
-                    caption_audio_path = text_to_speech_output(caption_text)
-                else:
-                    caption_text = "No frame available for caption"
+                    else:
+                        caption_text = model_moondream.caption(last_frame, length="normal")["caption"]
+                caption_audio_path = text_to_speech_output(caption_text)
+            else:
+                caption_text = "No frame available for caption"
+    except Exception as e:
+        print(f"Groq transcription error: {e}")
+        transcription = f"Transcription error: {e}"
+        caption_text = "Error during transcription"
+    finally:
+        # Remove the temporary file
+        try:
+            os.unlink(temp_file_name)
         except Exception as e:
-            print(f"Groq transcription error: {e}")
-            transcription = f"Transcription error: {e}"
-            caption_text = "Error during transcription"
-        finally:
-            # Remove the temporary file
-            try:
-                os.unlink(temp_file_name)
-            except Exception as e:
-                print(f"Error cleaning up file: {e}")
-            callback(transcription, caption_text, caption_audio_path)
-    threading.Thread(target=transcription_thread, daemon=True).start()
+            print(f"Error cleaning up file: {e}")
 
-def record_audio(audio):
+    return transcription, caption_text, caption_audio_path
+
+async def record_audio(audio):
     """
     Process recorded audio and start asynchronous transcription.
     
@@ -217,15 +218,9 @@ def record_audio(audio):
                 write(temp_file.name, sample_rate, audio_data)
                 print(f"Saved audio to temporary file: {temp_file.name}")
 
-                # Start asynchronous transcription using a callback to process results
-                def transcription_callback(transcription, caption_text, caption_audio_path):
-                    print("Final Transcription:", transcription)
-                    print("Caption:", caption_text)
-                    print("Caption Audio Path:", caption_audio_path)
-                    # In production, update shared state or notify UI accordingly.
-
-                transcribe_audio_async(temp_file.name, transcription_callback)
-                return transcription_placeholder, caption_placeholder, caption_audio_placeholder
+                # Start asynchronous transcription
+                transcription, caption_text, caption_audio_path = await transcribe_audio_async(temp_file.name)
+                return transcription, caption_text, caption_audio_path
 
             return "", "No audio data received", None
 
@@ -305,12 +300,14 @@ with gr.Blocks() as app:
         stream_every=0.1
     )
     
-    # Set up audio input processing.
+    # Set up audio input processing
     audio_input.change(
         fn=record_audio,
         inputs=[audio_input],
         outputs=[transcription_box, caption_box, caption_audio],
-        queue=True
+        queue=True,
+        api_name="record",
+        concurrency_limit=1
     )
     
     # Set up chat interface.
