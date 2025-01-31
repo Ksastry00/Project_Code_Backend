@@ -302,7 +302,7 @@ with gr.Blocks() as app:
         inputs=[camera_input],
         outputs=[video_output],
         queue=True,
-        stream_every=0.05
+        stream_every=0.1
     )
     
     # Set up audio input processing.
