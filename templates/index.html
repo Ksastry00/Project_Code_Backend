@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Live Image Analysis</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .container {
+            display: flex;
+            gap: 20px;
+        }
+        .video-section {
+            flex: 1;
+            position: relative;
+        }
+        .chat-section {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+        }
+        #videoElement {
+            display: none;
+        }
+        #canvasElement {
+            width: 100%;
+            margin-bottom: 10px;
+            background-color: #000;
+        }
+        #backBuffer {
+            display: none;
+        }
+        .controls {
+            margin-bottom: 20px;
+        }
+        #chatMessages {
+            height: 300px;
+            border: 1px solid #ccc;
+            overflow-y: auto;
+            padding: 10px;
+            margin-bottom: 10px;
+        }
+        .chat-input {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 10px;
+        }
+        #messageInput {
+            flex: 1;
+            padding: 8px;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+        }
+        .user-message {
+            color: blue;
+            margin-bottom: 8px;
+        }
+        .ai-message {
+            color: green;
+            margin-bottom: 8px;
+        }
+        button {
+            padding: 10px 20px;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            margin-right: 10px;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        button.recording {
+            background-color: #dc3545;
+        }
+        #processingStatus {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            color: white;
+            background: rgba(0,0,0,0.5);
+            padding: 5px 10px;
+            border-radius: 3px;
+            display: none;
+        }
+        #audioPlayer {
+            width: 100%;
+            margin-top: 10px;
+        }
+    </style>
+</head>
+<body>
+    <h1>Live Image Analysis</h1>
+    
+    <div class="container">
+        <div class="video-section">
+            <video id="videoElement" autoplay playsinline></video>
+            <canvas id="canvasElement"></canvas>
+            <canvas id="backBuffer"></canvas>
+            <div class="controls">
+                <button id="startButton">Stop Camera</button>
+                <button id="voiceButton">Hold to Speak</button>
+            </div>
+            <div id="processingStatus"></div>
+        </div>
+        
+        <div class="chat-section">
+            <div id="chatMessages"></div>
+            <div class="chat-input">
+                <input type="text" id="messageInput" placeholder="Type your message...">
+                <button onclick="sendMessage()">Send</button>
+            </div>
+            <audio id="audioPlayer" controls></audio>
+        </div>
+    </div>
+
+    <script>
+        let videoElement = document.getElementById('videoElement');
+        let canvasElement = document.getElementById('canvasElement');
+        let backBuffer = document.getElementById('backBuffer');
+        let startButton = document.getElementById('startButton');
+        let voiceButton = document.getElementById('voiceButton');
+        let chatMessages = document.getElementById('chatMessages');
+        let messageInput = document.getElementById('messageInput');
+        let audioPlayer = document.getElementById('audioPlayer');
+        let processingStatus = document.getElementById('processingStatus');
+        
+        let stream = null;
+        let isProcessing = false;
+        let animationFrame = null;
+        let isRecording = false;
+        let mediaRecorder = null;
+        let recordedChunks = [];
+        let isVideoReady = false;
+        let lastFrameTime = 0;
+        const frameInterval = 1000 / 60; // 60 FPS
+
+        voiceButton.textContent = 'Hold to Speak';
+        voiceButton.style.display = 'inline-block';
+
+        voiceButton.onmousedown = async () => {
+            try {
+                const audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                mediaRecorder = new MediaRecorder(audioStream);
+                recordedChunks = [];
+
+                mediaRecorder.ondataavailable = (e) => {
+                    if (e.data.size > 0) {
+                        recordedChunks.push(e.data);
+                    }
+                };
+
+                mediaRecorder.onstop = async () => {
+                    const audioBlob = new Blob(recordedChunks, { type: 'audio/webm' });
+                    const formData = new FormData();
+                    formData.append('audio', audioBlob);
+
+                    try {
+                        const response = await fetch('/transcribe', {
+                            method: 'POST',
+                            body: formData
+                        });
+                        
+                        const data = await response.json();
+                        if (data.error) {
+                            throw new Error(data.error);
+                        }
+                        
+                        if (data.text) {
+                            addMessage('user', data.text);
+                            await processVoiceInput(data.text);
+                        }
+                    } catch (err) {
+                        console.error('Transcription error:', err);
+                        addMessage('system', 'Error transcribing audio: ' + err.message);
+                    }
+
+                    audioStream.getTracks().forEach(track => track.stop());
+                };
+
+                mediaRecorder.start();
+                voiceButton.classList.add('recording');
+                voiceButton.textContent = 'Recording...';
+                isRecording = true;
+            } catch (err) {
+                console.error('Error starting recording:', err);
+                addMessage('system', 'Error accessing microphone: ' + err.message);
+            }
+        };
+
+        voiceButton.onmouseup = voiceButton.onmouseleave = () => {
+            if (isRecording && mediaRecorder && mediaRecorder.state === 'recording') {
+                mediaRecorder.stop();
+                isRecording = false;
+                voiceButton.classList.remove('recording');
+                voiceButton.textContent = 'Hold to Speak';
+            }
+        };
+
+        videoElement.addEventListener('loadedmetadata', () => {
+            console.log('Video dimensions:', videoElement.videoWidth, videoElement.videoHeight);
+            isVideoReady = true;
+            canvasElement.width = videoElement.videoWidth;
+            canvasElement.height = videoElement.videoHeight;
+            backBuffer.width = videoElement.videoWidth;
+            backBuffer.height = videoElement.videoHeight;
+            startProcessingFrames();
+        });
+
+        // Start webcam automatically when page loads
+        window.onload = async function startCamera() {
+            try {
+                stream = await navigator.mediaDevices.getUserMedia({ 
+                    video: { 
+                        width: { ideal: 640 },
+                        height: { ideal: 480 }
+                    }
+                });
+                videoElement.srcObject = stream;
+            } catch (err) {
+                console.error('Error accessing camera:', err);
+                addMessage('system', 'Error accessing camera: ' + err.message);
+                startButton.textContent = 'Start Camera';
+            }
+        };
+
+        startButton.onclick = () => {
+            if (stream) {
+                stopCamera();
+                startButton.textContent = 'Start Camera';
+            } else {
+                window.onload();
+                startButton.textContent = 'Stop Camera';
+            }
+        };
+
+
+        messageInput.addEventListener('keypress', (event) => {
+            if (event.key === 'Enter') {
+                sendMessage();
+            }
+        });
+
+        async function sendMessage() {
+            const text = messageInput.value.trim();
+            if (text) {
+                messageInput.value = ''; // Clear immediately
+                messageInput.disabled = true; // Disable while processing
+                try {
+                    addMessage('user', text);
+                    await processVoiceInput(text);
+                } finally {
+                    messageInput.disabled = false; // Re-enable after processing
+                    messageInput.focus(); // Return focus to input
+                }
+            }
+        }
+
+        function stopCamera() {
+            if (stream) {
+                stream.getTracks().forEach(track => track.stop());
+                stream = null;
+                videoElement.srcObject = null;
+                stopProcessingFrames();
+                isVideoReady = false;
+            }
+        }
+
+        function startProcessingFrames() {
+            if (!animationFrame) {
+                lastFrameTime = performance.now();
+                processFrame();
+            }
+        }
+
+        function stopProcessingFrames() {
+            if (animationFrame) {
+                cancelAnimationFrame(animationFrame);
+                animationFrame = null;
+            }
+        }
+
+        function addMessage(type, text) {
+            const div = document.createElement('div');
+            div.className = type + '-message';
+            div.textContent = text;
+            chatMessages.appendChild(div);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+
+        async function processFrame(timestamp) {
+            if (!stream || !isVideoReady) {
+                animationFrame = requestAnimationFrame(processFrame);
+                return;
+            }
+
+            // Maintain 60 FPS
+            const elapsed = timestamp - lastFrameTime;
+            if (elapsed < frameInterval) {
+                animationFrame = requestAnimationFrame(processFrame);
+                return;
+            }
+
+            if (isProcessing) {
+                animationFrame = requestAnimationFrame(processFrame);
+                return;
+            }
+            
+            isProcessing = true;
+            lastFrameTime = timestamp;
+            
+            try {
+                // Draw current frame to back buffer
+                const backCtx = backBuffer.getContext('2d', { alpha: false });
+                backCtx.drawImage(videoElement, 0, 0);
+                
+                const blob = await new Promise(resolve => {
+                    backBuffer.toBlob(resolve, 'image/jpeg', 0.95);
+                });
+
+                if (!blob) {
+                    throw new Error('Failed to create image blob');
+                }
+                
+                const formData = new FormData();
+                formData.append('image', blob);
+                
+                const response = await fetch('/analyze', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const data = await response.json();
+                
+                if (data.error) {
+                    throw new Error(data.error);
+                }
+                
+                // Load processed image and swap buffers
+                const processedImage = new Image();
+                processedImage.onload = () => {
+                    const ctx = canvasElement.getContext('2d', { alpha: false });
+                    ctx.drawImage(processedImage, 0, 0);
+                };
+                processedImage.src = data.image;
+                
+            } catch (error) {
+                console.error('Error processing frame:', error);
+                processingStatus.textContent = 'Error: ' + error.message;
+                processingStatus.style.display = 'block';
+            } finally {
+                isProcessing = false;
+                animationFrame = requestAnimationFrame(processFrame);
+            }
+        }
+
+        async function processVoiceInput(text) {
+            try {
+                const response = await fetch('/chat', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ message: text })
+                });
+                
+                const data = await response.json();
+                if (data.error) {
+                    throw new Error(data.error);
+                }
+                
+                addMessage('ai', data.response);
+                
+                if (data.audio) {
+                    audioPlayer.src = data.audio;
+                    audioPlayer.style.display = 'block';
+                    try {
+                        await audioPlayer.play();
+                    } catch (err) {
+                        console.error('Audio playback error:', err);
+                        audioPlayer.style.display = 'block';
+                    }
+                }
+                
+            } catch (error) {
+                console.error('Error processing voice input:', error);
+                addMessage('system', 'Error: ' + error.message);
+            }
+        }
+    </script>
+</body>
+</html>
